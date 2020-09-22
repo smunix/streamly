@@ -145,12 +145,14 @@ module Streamly.Internal.FileSystem.Event.Linux
     )
 where
 
-import Control.Monad (void, when)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad (forM, when, void)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Trans.State.Lazy (StateT, execStateT, get, put)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Foldable (foldlM)
 import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Word (Word8, Word32)
 import Foreign.C.Error (throwErrnoIfMinus1)
@@ -164,6 +166,9 @@ import GHC.IO.Handle.FD (mkHandleFromFD)
 import Streamly.Prelude (SerialT)
 import Streamly.Internal.Data.Parser (Parser)
 import Streamly.Internal.Data.Array.Storable.Foreign.Types (Array(..))
+import System.Directory (doesDirectoryExist, getDirectoryContents)
+import System.FilePath ((</>))
+import System.Posix.Files (getFileStatus, isDirectory)
 import System.IO (Handle, hClose, IOMode(ReadMode))
 #if !MIN_VERSION_base(4,10,0)
 import Control.Concurrent.MVar (readMVar)
@@ -175,24 +180,16 @@ import GHC.IO.Handle.Types (Handle__(..), Handle(FileHandle, DuplexHandle))
 import GHC.IO.Handle.FD (handleToFd)
 #endif
 
+import qualified Data.ByteString.UTF8 as BSU
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
+import qualified Data.Map as M
 import qualified Streamly.Internal.Data.Fold as FL
 import qualified Streamly.Internal.Data.Parser as PR
 import qualified Streamly.Internal.Data.Stream.IsStream as S
 import qualified Streamly.Internal.Unicode.Stream as U
 import qualified Streamly.Internal.FileSystem.Handle as FH
 import qualified Streamly.Internal.Data.Array.Storable.Foreign as A
-import Control.Monad
-import System.Directory
-import System.FilePath
-import System.Posix.Files
-import Control.Monad.Trans.State.Lazy
-import Control.Monad.IO.Class (MonadIO(liftIO))
-import qualified Data.Map as M
-import qualified Data.ByteString.UTF8 as BSU
-import Data.Foldable
-import Data.IORef
 
 -------------------------------------------------------------------------------
 -- Subscription to events
@@ -333,7 +330,6 @@ addToWatchRec cfg@Config{..} (Watch handle wdMap) rootMap path = do
     writeIORef wdMap k            
     return $ (cfg, Watch handle wdMap , rootMap)   
 
-
 bulkAddToWatch :: Config -> Watch -> RootMap -> Array Word8
     -> IO (Config, Watch, RootMap)
 bulkAddToWatch cfg@Config{..} (Watch handle wdMap) rootMap newDir = do
@@ -350,13 +346,10 @@ bulkAddToWatch cfg@Config{..} (Watch handle wdMap) rootMap newDir = do
             writeIORef wdMap k     
             return $ (cfg, Watch handle wdMap , rootMap)
             ) (cfg, Watch handle wdMap , rootMap) pathArr
-          
-           
 
 -------------------------------------------------------------------------------
 -- Settings
 -------------------------------------------------------------------------------
-
 
 foreign import capi
     "sys/inotify.h value IN_DONT_FOLLOW" iN_DONT_FOLLOW :: Word32

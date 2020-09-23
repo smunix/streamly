@@ -180,7 +180,6 @@ import GHC.IO.Handle.Types (Handle__(..), Handle(FileHandle, DuplexHandle))
 import GHC.IO.Handle.FD (handleToFd)
 #endif
 
-import qualified Data.ByteString.UTF8 as BSU
 import qualified Data.IntMap.Lazy as Map
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as M
@@ -239,6 +238,12 @@ type RootMap = IORef (M.Map FilePath (FilePath, FilePath))
 exclude :: FilePath -> Bool
 exclude path = head path /= '.'
 
+splitFilePathSeq :: FilePath -> FilePath -> IO [FilePath]
+splitFilePathSeq pat xs = S.toList $ S.splitOnSeq (A.fromList pat) (FL.toList) (S.fromList xs)
+
+getPathDiff :: [FilePath] -> FilePath
+getPathDiff paths = tail . concat $ tail paths
+
 -- | Traverse a dir recusively and return the list of subdirs.
 --
 -- /Internal/
@@ -254,12 +259,9 @@ traverseDirRec top gtop = do
         ds <- liftIO $ getDirectoryContents top
         let dss = filter exclude ds  
         paths <- forM dss $ \d -> do
-            let path = top </> d      
-                l1 = BSU.length $ BSU.fromString gtop
-                sdiff = BSU.toString 
-                    $ snd
-                    $ BSU.splitAt (l1+1) 
-                    $ BSU.fromString path
+            let path = top </> d                   
+            pl <- liftIO $ splitFilePathSeq gtop path
+            let sdiff = getPathDiff pl            
             s <- liftIO $ getFileStatus path
             (st, rootMap) <- get 
             if isDirectory s        
@@ -866,12 +868,9 @@ readOneEvent cfg wt@(Watch _ wdMap) rootMap = do
             if eventFlag .&. iN_CREATE /= 0 && eventFlag .&. iN_ISDIR /= 0
             then do 
                 km <- PR.yieldM $ readIORef  rootMap
-                let gtop = utf8ToString base
-                    l1 = BSU.length $ BSU.fromString gtop
-                    sdiff = BSU.toString 
-                        $ snd 
-                        $ BSU.splitAt (l1+1) 
-                        $ BSU.fromString xpath
+                let gtop = utf8ToString base                    
+                pl <- PR.yieldM $ splitFilePathSeq gtop xpath
+                let sdiff = getPathDiff pl        
                     k = M.insert xpath ((utf8ToString base), sdiff) km
                 PR.yieldM $ writeIORef rootMap k                                                        
                 PR.yieldM $ bulkAddToWatch cfg1 wt1 rootMap1 path                                                        

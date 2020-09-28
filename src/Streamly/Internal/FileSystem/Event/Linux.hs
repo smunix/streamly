@@ -181,8 +181,9 @@ import GHC.IO.Handle.FD (handleToFd)
 #endif
 
 import qualified Data.IntMap.Lazy as Map
+import qualified Data.List as L 
 import qualified Data.List.NonEmpty as NonEmpty
-import qualified Data.Map as M
+import qualified Data.Map.Lazy as M
 import qualified Streamly.Internal.Data.Fold as FL
 import qualified Streamly.Internal.Data.Parser as PR
 import qualified Streamly.Internal.Data.Stream.IsStream as S
@@ -238,12 +239,6 @@ type RootMap = IORef (M.Map FilePath (FilePath, FilePath))
 exclude :: FilePath -> Bool
 exclude path = head path /= '.'
 
-splitFilePathSeq :: FilePath -> FilePath -> IO [FilePath]
-splitFilePathSeq pat xs = S.toList $ S.splitOnSeq (A.fromList pat) (FL.toList) (S.fromList xs)
-
-getPathDiff :: [FilePath] -> FilePath
-getPathDiff paths = tail . concat $ tail paths
-
 -- | Traverse a dir recusively and return the list of subdirs.
 --
 -- /Internal/
@@ -251,8 +246,9 @@ getPathDiff paths = tail . concat $ tail paths
 traverseDirRec :: 
        FilePath -- ^ subdir path
     -> FilePath -- ^ root dir path
+    -> [FilePath] -- ^ roots passed on commnd line
     -> StateT ([FilePath], RootMap) IO [FilePath] -- ^ Mapping with root dir
-traverseDirRec top gtop = do
+traverseDirRec top gtop roots = do
     dde <- liftIO $ doesDirectoryExist top 
     if dde 
     then do
@@ -260,17 +256,16 @@ traverseDirRec top gtop = do
         let dss = filter exclude ds  
         paths <- forM dss $ \d -> do
             let path = top </> d                   
-            pl <- liftIO $ splitFilePathSeq gtop path
-            let sdiff = getPathDiff pl            
+            (otop, sdiff) <- liftIO $ getRootSplit $ findRoot path roots             
             s <- liftIO $ getFileStatus path
             (st, rootMap) <- get 
             if isDirectory s        
             then  do 
-                km <- liftIO $ readIORef rootMap
-                let k = M.insert path (gtop, sdiff) km
+                km <- liftIO $ readIORef rootMap             
+                let k = M.insert path (otop, sdiff) km
                 liftIO $ writeIORef rootMap k
                 put (path : st, rootMap) 
-                traverseDirRec path gtop
+                traverseDirRec path gtop roots
             else return []       
         return (concat paths)
     else return [] 
@@ -287,42 +282,81 @@ rootPathMappings paths = do
             $ paths   
     newIORef pm2
 
+-------------------------------------------------------------------------------
+-- Utilities
+-------------------------------------------------------------------------------
+
 mergeMap :: RootMap -> RootMap -> IO (RootMap)      
 mergeMap m1 m2 = do
     xm1 <- readIORef m1
     xm2 <- readIORef m2
     newIORef $ M.union xm1 xm2
 
+splitPath :: (MonadIO m) =>
+     FilePath -> FilePath -> m [FilePath]
+splitPath pat xs = S.toList 
+    $ S.splitOnSeq (A.fromList pat) (FL.toList) (S.fromList xs)
+
+-- | Map the list of original roots passed thru command line to subdir
+-- and split the sbudir to original root and remaining path 
+-- /Internal/
+--
+findRoot :: 
+       FilePath -- ^ subdir path    
+    -> [FilePath] -- ^ list of roots passed thru command line
+    -> S.SerialT IO (FilePath, FilePath) -- ^ Mapping with original root dir
+findRoot xpath rootList = do    
+    let roots = S.fromList rootList :: S.SerialT IO FilePath      
+        splits = S.mapM (\p -> splitPath p xpath) roots
+    ll <- S.filter (\a -> L.length  a > 1) splits
+    index <- S.findIndices (\a -> L.length  a > 1) splits  
+    let k = L.concat ll
+        j = case length k of
+                0 -> ""
+                _ -> tail k -- ^ remove leading slash
+    return $ (rootList !! index, j)
+ 
+getRootSplit :: 
+       S.SerialT IO (FilePath, FilePath) 
+    -> IO (FilePath, FilePath)
+
+getRootSplit strm = do
+    tlist <- S.toList strm  
+    return $ L.head tlist    
+
 -- | Map the list of input paths to subdir to root path maping.
 --
 -- /Internal/
 --
-generateSubdirMap :: [FilePath] -> IO (RootMap)
-generateSubdirMap paths = do 
+generateSubdirMap :: [FilePath] -> [FilePath] -> IO (RootMap)
+generateSubdirMap paths roots = do 
     let pathMap = M.empty    
     fpaths <- mapM  (\p -> do
         let initState = M.insert p (p,"") pathMap
         mapRef <- newIORef initState  
-        execStateT (traverseDirRec p p) ([p], mapRef)) paths  
+        execStateT (traverseDirRec p p roots) ([p], mapRef)) paths  
     me <- newIORef M.empty
     foldlM  (\pp qq -> mergeMap pp (snd qq)) me $ fpaths 
 
 toUtf8 :: MonadIO m => String -> m (Array Word8)
 toUtf8 = A.fromStream . U.encodeUtf8 . S.fromList
 
-openWatchRec :: Config -> NonEmpty (Array Word8) -> IO (Config, Watch, RootMap)
+openWatchRec :: 
+       Config 
+    -> NonEmpty (Array Word8) 
+    -> IO (Config, Watch, RootMap ,[FilePath])
 openWatchRec cfg paths = do
     let pathList = map  utf8ToString $ NonEmpty.toList paths
-    pathMap <- generateSubdirMap pathList
+    pathMap <- generateSubdirMap pathList pathList
     km <- readIORef  pathMap
     pathArr <- mapM toUtf8 $ M.keys km
     w <- createWatch
-    foldlM (\(cfg1, w1 ,m1) pth -> addToWatchRec cfg1  w1 m1 pth) 
-        (cfg, w, pathMap) pathArr    
+    foldlM (\(cfg1, w1 ,m1, roots) pth -> addToWatchRec cfg1  w1 m1 pth roots) 
+        (cfg, w, pathMap, pathList) pathArr    
 
-addToWatchRec :: Config -> Watch -> RootMap -> Array Word8 
-    -> IO (Config, Watch, RootMap)
-addToWatchRec cfg@Config{..} (Watch handle wdMap) rootMap path = do
+addToWatchRec :: Config -> Watch -> RootMap -> Array Word8 -> [FilePath]
+    -> IO (Config, Watch, RootMap, [FilePath])
+addToWatchRec cfg@Config{..} (Watch handle wdMap) rootMap path roots = do
     fd <- handleToFd handle
     wd <- A.asCString path $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatchRec " ++ utf8ToString path) $
@@ -330,19 +364,22 @@ addToWatchRec cfg@Config{..} (Watch handle wdMap) rootMap path = do
     km <- readIORef  wdMap
     let k = (Map.insert (fromIntegral wd) path km)
     writeIORef wdMap k            
-    return $ (cfg, Watch handle wdMap , rootMap)   
+    return $ (cfg, Watch handle wdMap, rootMap, roots)   
 
-bulkAddToWatch :: Config -> Watch -> RootMap -> Array Word8
+bulkAddToWatch :: Config -> Watch -> RootMap -> Array Word8 -> [FilePath]
     -> IO (Config, Watch, RootMap)
-bulkAddToWatch cfg@Config{..} (Watch handle wdMap) rootMap newDir = do
+bulkAddToWatch cfg@Config{..} (Watch handle wdMap) rootMap newDir roots = do
     fd <- handleToFd handle
-    pathMap <- generateSubdirMap ((utf8ToString newDir):[])
+    pathMap <- generateSubdirMap ((utf8ToString newDir):[]) roots
     km <- readIORef  pathMap
+    mergedMapRef <- mergeMap rootMap pathMap
+    mergedMap <- readIORef mergedMapRef
+    writeIORef rootMap $ mergedMap     
     pathArr <- mapM toUtf8 $ M.keys km
     foldlM (\(_, _ ,_) path -> do 
             wd <- A.asCString path $ \pathPtr ->
-                throwErrnoIfMinus1 ("addToWatchRec " ++ utf8ToString path) $
-                c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
+                throwErrnoIfMinus1 ("addToWatchRec " ++ utf8ToString path) 
+                $ c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
             km2 <- readIORef  wdMap
             let k = (Map.insert (fromIntegral wd) path km2)
             writeIORef wdMap k     
@@ -758,20 +795,23 @@ removeFromWatch (Watch handle wdMap) path = do
 --
 -- /Internal/
 --
-openWatch :: Config -> NonEmpty (Array Word8) -> IO (Config, Watch, RootMap)
+openWatch :: 
+       Config 
+    -> NonEmpty (Array Word8) 
+    -> IO (Config, Watch, RootMap, [FilePath])
 openWatch cfg paths = do
     let pathList = map  utf8ToString $ NonEmpty.toList paths
     w <- createWatch
     pathMap <- rootPathMappings pathList
-    foldlM (\(cfg1, w1 ,m1) pth -> addToWatchRec cfg1  w1 m1 pth) 
-        (cfg, w, pathMap)  (NonEmpty.toList paths)    
+    foldlM (\(cfg1, w1 ,m1, roots) pth -> addToWatchRec cfg1  w1 m1 pth roots) 
+        (cfg, w, pathMap, pathList)  (NonEmpty.toList paths)    
     
 -- | Close a 'Watch' handle.
 --
 -- /Internal/
 --
-closeWatch :: (Config, Watch, RootMap) -> IO ()
-closeWatch (_, (Watch h _), _) = hClose h
+closeWatch :: (Config, Watch, RootMap, [FilePath]) -> IO ()
+closeWatch (_, (Watch h _), _, _) = hClose h
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle
@@ -807,8 +847,8 @@ data Event = Event
 -- to measure the perf.
 --
 
-readOneEvent :: Config -> Watch -> RootMap -> Parser IO Word8 Event
-readOneEvent cfg wt@(Watch _ wdMap) rootMap = do
+readOneEvent :: Config -> Watch -> RootMap -> [FilePath] -> Parser IO Word8 Event
+readOneEvent cfg wt@(Watch _ wdMap) rootMap roots= do
     let headerLen = (sizeOf (undefined :: CInt)) + 12
     arr <- PR.takeEQ headerLen (A.writeN headerLen)
     (ewd, eflags, cookie, pathLen) <- PR.yieldM $ A.asPtr arr readHeader
@@ -827,13 +867,13 @@ readOneEvent cfg wt@(Watch _ wdMap) rootMap = do
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
             return pth
         else return $ A.fromList []
-    xm <- PR.yieldM $ readIORef wdMap    
+    xm <- PR.yieldM $ readIORef wdMap        
     let base = case Map.lookup (fromIntegral ewd) xm of
                     Just path1 -> path1   
                     Nothing -> path
     let xpath = utf8ToString base </> utf8ToString  path   
     xpathArr <- PR.yieldM $ toUtf8 xpath
-    (_, _, rm) <- processEvent eflags cfg wt rootMap xpathArr xpath base   
+    (_, _, rm) <- processEvent eflags cfg wt rootMap xpathArr xpath roots  
     rm2 <- PR.yieldM $ readIORef rm
     xm2 <- PR.yieldM $ readIORef wdMap      
     return $ Event
@@ -861,23 +901,22 @@ readOneEvent cfg wt@(Watch _ wdMap) rootMap = do
             -> Watch 
             -> RootMap 
             -> Array Word8 
-            -> String 
-            -> Array Word8 
+            -> FilePath            
+            -> [FilePath]
             -> Parser IO Word8 (Config, Watch, RootMap)
-        processEvent eventFlag cfg1 wt1 rootMap1 path xpath base = do
+        processEvent eventFlag cfg1 wt1 rootMap1 path xpath rootList = do
             if eventFlag .&. iN_CREATE /= 0 && eventFlag .&. iN_ISDIR /= 0
             then do 
-                km <- PR.yieldM $ readIORef  rootMap
-                let gtop = utf8ToString base                    
-                pl <- PR.yieldM $ splitFilePathSeq gtop xpath
-                let sdiff = getPathDiff pl        
-                    k = M.insert xpath ((utf8ToString base), sdiff) km
-                PR.yieldM $ writeIORef rootMap k                                                        
-                PR.yieldM $ bulkAddToWatch cfg1 wt1 rootMap1 path                                                        
+                km <- PR.yieldM $ readIORef  rootMap1                
+                (gtop, sdiff) <- PR.yieldM 
+                    $ getRootSplit $ findRoot xpath rootList                  
+                let k = M.insert xpath (gtop, sdiff) km
+                PR.yieldM $ writeIORef rootMap1 k                                                        
+                PR.yieldM $ bulkAddToWatch cfg1 wt1 rootMap1 path rootList                                                       
             else return (cfg1, wt1, rootMap1)
 
-watchToStream :: (Config, Watch, RootMap) -> SerialT IO Event
-watchToStream (cfg, wt@(Watch handle _), rootMap) =
+watchToStream :: (Config, Watch, RootMap, [FilePath]) -> SerialT IO Event
+watchToStream (cfg, wt@(Watch handle _), rootMap, roots) =
     -- Do not use too small a buffer. As per inotify man page:
     --
     -- The behavior when the buffer given to read(2) is too small to return
@@ -888,7 +927,7 @@ watchToStream (cfg, wt@(Watch handle _), rootMap) =
     --          sizeof(struct inotify_event) + NAME_MAX + 1
     --
     -- will be sufficient to read at least one event.
-    S.parseMany (readOneEvent cfg wt rootMap) $ S.unfold FH.read handle
+    S.parseMany (readOneEvent cfg wt rootMap roots) $ S.unfold FH.read handle
 
 -- | Start monitoring a list of file system paths for file system events with
 -- the supplied configuration operation over the 'defaultConfig'. The
@@ -966,34 +1005,42 @@ getRoot Event{..} =
 --
 -- /Internal/
 --
-getRootStr :: Event -> String
-getRootStr Event{..} =
+getMappedRoot :: Event -> String
+getMappedRoot Event{..} =    
     if (eventWd >= 1)
     then
         case Map.lookup (fromIntegral eventWd) eventMap of
             Just path -> case M.lookup (utf8ToString path) rootPathMap of
                             Just rpath -> fst rpath
-                            Nothing -> ""
+                            Nothing -> error 
+                                $ "Bug: getRoot: No path found "
+                                ++ "corresponding to the "
+                                ++ "watch descriptor " 
+                                ++ show eventWd
             Nothing ->
                 error $ "Bug: getRoot: No path found corresponding to the "
                     ++ "watch descriptor " ++ show eventWd
     else ""
-
+       
 -- | Get the relative path w.r.t root dir of mapped target
 --
 -- /Internal/
 --
-getRelPathStr :: Event -> String
-getRelPathStr Event{..} = 
-    let sfx = utf8ToString eventRelPath  
-        yy =  case Map.lookup (fromIntegral eventWd) eventMap of
-                    Just path -> case M.lookup (utf8ToString path) rootPathMap of
-                                    Just rpath -> snd rpath
-                                    Nothing -> ""
-                    Nothing ->
-                        error $ "Bug: getRoot: No path found corresponding to the "
-                        ++ "watch descriptor " ++ show eventWd                    
-        in yy </> sfx                            
+getMappedRelPath :: Event -> String
+getMappedRelPath Event{..} = 
+    let sfx = utf8ToString eventRelPath 
+        pfx = case Map.lookup (fromIntegral eventWd) eventMap of
+                Just path -> case M.lookup (utf8ToString path) rootPathMap of
+                                Just rpath -> snd rpath
+                                Nothing -> error 
+                                    $ "Bug: getRoot: No path found "
+                                    ++ "corresponding to the "
+                                    ++ "watch descriptor " 
+                                    ++ show eventWd
+                Nothing ->
+                    error $ "Bug: getRoot: No path found corresponding to the "
+                    ++ "watch descriptor " ++ show eventWd                    
+        in pfx </> sfx                            
 
 
 -- XXX should we use a Maybe here?
@@ -1243,8 +1290,8 @@ showEvent :: Event -> String
 showEvent ev@Event{..} =
        "--------------------------"
     ++ "\nWd = " ++ show eventWd        
-    ++ "\nRoot = " ++ show (getRootStr ev)   
-    ++ "\nPath = " ++ show (getRelPathStr ev)
+    ++ "\nRoot = " ++ show (getMappedRoot ev)   
+    ++ "\nPath = " ++ show (getMappedRelPath ev)
     ++ "\nCookie = " ++ show (getCookie ev)
     ++ "\nFlags " ++ show eventFlags
 

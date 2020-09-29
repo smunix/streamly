@@ -313,7 +313,7 @@ findRoot xpath rootList = do
     let k = L.concat ll
         j = case length k of
                 0 -> ""
-                _ -> tail k -- ^ remove leading slash
+                _ -> tail k
     return $ (rootList !! index, j)
  
 getRootSplit :: 

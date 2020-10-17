@@ -31,6 +31,21 @@ let haskellPackages =
 
     mkHaskellPackages = inShell:
         haskellPackages.override {
+            packageSetConfig = self: super: {
+                # This disables checks on all the packages.
+
+                # Adding "doBenchmark = true" causes infinite recursion,
+                # probably because of "super.mkDerivation". "mkDerivation" might
+                # itself have benchmarks. We can probably directly call
+                # "mkDerivation" and try. Need to search where it is defined.
+
+                # Strangely enough mapping over haskellPackages and setting
+                # "doCheck = false" where available, does not work. Probably
+                # because of evaluation semantics.
+                mkDerivation = drv: super.mkDerivation (drv // {
+                    doCheck = false;
+                });
+            };
             overrides = self: super:
                 with nixpkgs.haskell.lib;
                 {
@@ -39,19 +54,9 @@ let haskellPackages =
                         mkPackage self "streamly-benchmarks"
                             ./benchmark c2nix inShell;
                     QuickCheck = self.QuickCheck_2_14;
-
-                    # We need the ability to disable doCheck on all
-                    # those packages that are being built locally and
-                    # not fetched from the cache. Running tests could do
-                    # nasty things to the machine e.g. some tests even
-                    # listen for incoming connections on the network.
-                    hspec-core =
-                        super.hspec-core.overrideAttrs
-                            (oldAttrs: {doCheck = false;});
                     selective =
                         super.selective.overrideAttrs (oldAttrs:
-                          { doCheck = false;
-                            configureFlags =
+                          { configureFlags =
                               oldAttrs.configureFlags ++ ["--disable-tests"];
                           });
                 };

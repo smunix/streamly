@@ -102,7 +102,7 @@ module Streamly.Internal.Data.Fold
     -- , ldeleteBy
     -- , luniq
     , lcatMaybes
-
+    , mapMaybe
     {-
     -- ** Mapping Filters
     , lmapMaybe

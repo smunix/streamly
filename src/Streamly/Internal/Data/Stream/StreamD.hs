@@ -339,7 +339,7 @@ import Streamly.Internal.Data.Time.Clock (Clock(Monotonic), getTime)
 import Streamly.Internal.Data.Time.Units
        (MicroSecond64(..), fromAbsTime, toAbsTime, AbsTime)
 import Streamly.Internal.Data.Unfold.Types (Unfold(..))
-import Streamly.Internal.Data.Tuple.Strict (Tuple'(..), Tuple3'(..))
+import Streamly.Internal.Data.Tuple.Strict (Tuple3'(..))
 import Streamly.Internal.Data.Stream.SVar (fromConsumer, pushToFold)
 
 import qualified Streamly.Internal.Data.IORef.Prim as Prim
@@ -1540,7 +1540,7 @@ splitSuffixBy predicate f = foldMany1 (FL.sliceSepBy predicate f)
 data WordsByState fs s a b
     = WordYield !b !(WordsByState fs s a b)
     | WordBegin !s
-    | WordBeginWith !s !a
+    | WordFoldWith !fs !s !a
     | WordFold !fs !s
 
 -- This has a hard time fusing even with simple pipeline.
@@ -1558,11 +1558,11 @@ wordsBy predicate (Fold fstep initial done) (Stream step state) =
         res <- step (adaptState gst) st
         case res of
             Yield x s ->
-                return
-                  $ Skip
-                  $ if predicate x
-                    then WordBegin s
-                    else WordBeginWith s x
+                 if predicate x
+                 then return $ Skip $ WordBegin s
+                 else do
+                      ini <- initial
+                      return $ Skip $ WordFoldWith ini s x
             Skip s -> return $ Skip $ WordBegin s
             Stop -> return Stop
     step1 gst (WordFold fs st) = do
@@ -1579,26 +1579,27 @@ wordsBy predicate (Fold fstep initial done) (Stream step state) =
                 bres <- done fs
                 return $ Skip $ WordYield bres (WordBegin st)
     step1 _ (WordYield bres ns) = return $ Yield bres ns
-    step1 _ (WordBeginWith s x) = do
+    step1 _ (WordFoldWith fs s x) =
         -- XXX We dont need to check for predicate here, we already know "x"
         -- does not satisfy the predicate.
-        ini <- initial
-        wordFoldWith ini s x
+        -- XXX Manually inline this function
+        wordFoldWith fs s x
 
     {-# INLINE wordFoldWith #-}
     wordFoldWith fs s x = do
         -- XXX We dont need to check for predicate here, we already know "x"
         -- does not satisfy the predicate.
         fs1 <- fstep fs x
-        return
-          $ Skip
-          $ case fs1 of
-                FL.Partial sres -> WordFold sres s
-                FL.Done bres -> WordYield bres (WordBegin s)
-                -- XXX This will lead to an infinite loop most of the time.  But
-                -- it may terminate as it is an effectful step function. If
-                -- possible, we should somehow warn the user.
-                FL.Done1 bres -> WordYield bres (WordBeginWith s x)
+        case fs1 of
+            FL.Partial sres -> return $ Skip $ WordFold sres s
+            FL.Partial1 sres -> return $ Skip $ WordFoldWith sres s x
+            FL.Done bres -> return $ Skip $ WordYield bres (WordBegin s)
+            -- XXX This will lead to an infinite loop most of the time.  But
+            -- it may terminate as it is an effectful step function. If
+            -- possible, we should somehow warn the user.
+            FL.Done1 bres -> do
+                ini <- initial
+                return $ Skip $ WordYield bres (WordFoldWith ini s x)
 
 -- String search algorithms:
 -- http://www-igm.univ-mlv.fr/~lecroq/string/index.html
@@ -3717,29 +3718,37 @@ scanlMx' :: Monad m
 scanlMx' fstep begin done s =
     (begin >>= \x -> x `seq` done x) `consM` postscanlMx' fstep begin done s
 
+
+data PostScanState fsM s a = PostScan s !fsM | PostScanWith s !fsM a
+
 {-# INLINE_NORMAL postscanOnce #-}
 postscanOnce :: Monad m
     => FL.Fold m a b -> Stream m a -> Stream m b
 postscanOnce (FL.Fold fstep begin done) (Stream step state) =
-    Stream step' (Tuple' state begin)
+    Stream step' (PostScan state begin)
 
     where
 
     {-# INLINE_LATE step' #-}
-    step' gst (Tuple' st acc) = do
+    step' _ (PostScanWith st acc x) = do
+        old <- acc
+        y <- fstep old x
+        case y of
+            FL.Partial sres -> do
+                !v <- done sres
+                return $ Yield v $ PostScan st (return sres)
+            FL.Partial1 sres -> do
+                !v <- done sres
+                return $ Yield v $ PostScanWith st (return sres) x
+            FL.Done _ -> return $ Stop
+            FL.Done1 _ -> return $ Stop
+    step' gst (PostScan st acc) = do
         r <- step (adaptState gst) st
-        case r of
-            Yield x s -> do
-                old <- acc
-                y <- fstep old x
-                case y of
-                    FL.Partial sres -> do
-                        !v <- done sres
-                        return (Yield v (Tuple' s (return sres)))
-                    FL.Done _ -> return $ Stop
-                    FL.Done1 _ -> return $ Stop
-            Skip s -> return $ Skip (Tuple' s acc)
-            Stop -> return Stop
+        return
+            $ case r of
+                  Yield x s -> Skip $ PostScanWith s acc x
+                  Skip s -> Skip $ PostScan s acc
+                  Stop -> Stop
 
 {-# INLINE scanOnce #-}
 scanOnce :: Monad m
@@ -3926,7 +3935,8 @@ rollingMap f = rollingMapM (\x y -> return $ f x y)
 -- Tapping/Distributing
 ------------------------------------------------------------------------------
 
-data TapState sv st = TapInit | Tapping sv st | TapDone st
+data TapState sv st a
+    = TapInit | Tapping sv st | TappingWith sv st a | TapDone st
 
 -- XXX Multiple yield points
 {-# INLINE tap #-}
@@ -3938,17 +3948,20 @@ tap (Fold fstep initial extract) (Stream step state) = Stream step' TapInit
     step' _ TapInit = do
         r <- initial
         return $ Skip (Tapping r state)
+    step' _ (TappingWith !acc st x) = do
+        acc1 <- fstep acc x
+        return
+          $ case acc1 of
+                FL.Partial sres -> Yield x (Tapping sres st)
+                FL.Partial1 sres -> Yield x (TappingWith sres st x)
+                FL.Done _ -> Yield x (TapDone st)
+                FL.Done1 _ -> Yield x (TapDone st)
     step' gst (Tapping acc st) =
+        -- XXX Get rid of seq
         acc `seq` do
             r <- step gst st
             case r of
-                Yield x s -> do
-                    acc1 <- fstep acc x
-                    return
-                      $ case acc1 of
-                            FL.Partial sres -> Yield x (Tapping sres s)
-                            FL.Done _ -> Yield x (TapDone s)
-                            FL.Done1 _ -> Yield x (TapDone s)
+                Yield x s -> return $ Skip $ TappingWith acc s x
                 Skip s -> return $ Skip (Tapping acc s)
                 Stop -> do
                     void $ extract acc
@@ -3961,7 +3974,11 @@ tap (Fold fstep initial extract) (Stream step state) = Stream step' TapInit
                 Skip s -> Skip (TapDone s)
                 Stop -> Stop
 
-data TapOffState fs s b n = TapOffInit | TapOffTapping fs s n | TapOffDone s
+data TapOffState fs s a n
+    = TapOffInit
+    | TapOffTapping fs s n
+    | TapOffTappingWith fs s a
+    | TapOffDone s
 
 -- XXX Multiple yield points
 {-# INLINE_NORMAL tapOffsetEvery #-}
@@ -3976,26 +3993,25 @@ tapOffsetEvery offset n (Fold fstep initial extract) (Stream step state) =
     step' _ TapOffInit = do
         r <- initial
         return $ Skip $ TapOffTapping r state (offset `mod` n)
-    step' gst (TapOffTapping acc st count)
-        | count <= 0 = do
-            r <- step gst st
-            case r of
-                Yield x s -> do
-                    acc1 <- fstep acc x
-                    return
-                      $ case acc1 of
-                            FL.Partial sres ->
-                                Yield x (TapOffTapping sres s (n - 1))
-                            FL.Done _ -> Yield x (TapOffDone s)
-                            FL.Done1 _ -> Yield x (TapOffDone s)
-                Skip s -> return $ Skip (TapOffTapping acc s count)
-                Stop -> do
-                    void $ extract acc
-                    return $ Stop
+    step' _ (TapOffTappingWith acc st x) = do
+        acc1 <- fstep acc x
+        return
+          $ case acc1 of
+                FL.Partial sres ->
+                    Yield x $ TapOffTapping sres st (n - 1)
+                FL.Partial1 sres ->
+                    -- XXX Is this a natural behaviour?
+                    Skip $ TapOffTappingWith sres st x
+                FL.Done _ -> Yield x (TapOffDone st)
+                FL.Done1 _ -> Yield x (TapOffDone st)
     step' gst (TapOffTapping acc st count) = do
         r <- step gst st
         case r of
-            Yield x s -> return $ Yield x (TapOffTapping acc s (count - 1))
+            Yield x s ->
+                return
+                    $ if count <= 0
+                      then Skip $ TapOffTappingWith acc s x
+                      else Yield x $ TapOffTapping acc s (count - 1)
             Skip s -> return $ Skip (TapOffTapping acc s count)
             Stop -> do
                 void $ extract acc
@@ -4538,15 +4554,17 @@ foldOnce (Fold fstep begin done) (Stream step state) =
     begin >>= \x -> go SPEC x state
   where
     {-# INLINE_LATE go #-}
+    goWith !_ !fs st x = do
+        res <- fstep fs x
+        case res of
+            FL.Done b -> return b
+            FL.Done1 b -> return b
+            FL.Partial sres -> go SPEC sres st
+            FL.Partial1 sres -> goWith SPEC sres st x
     go !_ !fs st = do
         r <- step defState st
         case r of
-            Yield x s -> do
-                res <- fstep fs x
-                case res of
-                    FL.Done b -> return b
-                    FL.Done1 b -> return b
-                    FL.Partial sres -> go SPEC sres s
+            Yield x s -> goWith SPEC fs s x
             Skip s -> go SPEC fs s
             Stop   -> done fs
 
@@ -4749,6 +4767,9 @@ tapAsync f (Stream step1 state1) = Stream step TapInit
             Yield a s -> Yield a (TapDone s)
             Skip s    -> Skip (TapDone s)
             Stop      -> Stop
+
+    -- XXX Come up with a better message
+    step _ _ = error "Illegal state"
 
 -- XXX Exported from Array again as this fold is specific to Array
 -- | Take last 'n' elements from the stream and discard the rest.

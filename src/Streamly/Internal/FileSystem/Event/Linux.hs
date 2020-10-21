@@ -145,14 +145,15 @@ module Streamly.Internal.FileSystem.Event.Linux
     )
 where
 
-import Control.Monad (forM, when, void)
+import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
-import Control.Monad.Trans.State.Lazy (StateT, execStateT, get, put)
+import Data.Bifunctor (bimap)
 import Data.Bits ((.|.), (.&.), complement)
 import Data.Foldable (foldlM)
 import Data.Functor.Identity (runIdentity)
 import Data.IntMap.Lazy (IntMap)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Function ((&))
 import Data.List.NonEmpty (NonEmpty)
 import Data.Word (Word8, Word32)
 import Foreign.C.Error (throwErrnoIfMinus1)
@@ -166,9 +167,7 @@ import GHC.IO.Handle.FD (mkHandleFromFD)
 import Streamly.Prelude (SerialT)
 import Streamly.Internal.Data.Parser (Parser)
 import Streamly.Internal.Data.Array.Storable.Foreign.Types (Array(..))
-import System.Directory (doesDirectoryExist, getDirectoryContents)
 import System.FilePath ((</>))
-import System.Posix.Files (getFileStatus, isDirectory)
 import System.IO (Handle, hClose, IOMode(ReadMode))
 #if !MIN_VERSION_base(4,10,0)
 import Control.Concurrent.MVar (readMVar)
@@ -181,15 +180,14 @@ import GHC.IO.Handle.FD (handleToFd)
 #endif
 
 import qualified Data.IntMap.Lazy as Map
-import qualified Data.List as L 
 import qualified Data.List.NonEmpty as NonEmpty
-import qualified Data.Map.Lazy as M
+import qualified Streamly.Internal.Data.Array.Storable.Foreign as A
 import qualified Streamly.Internal.Data.Fold as FL
 import qualified Streamly.Internal.Data.Parser as PR
 import qualified Streamly.Internal.Data.Stream.IsStream as S
-import qualified Streamly.Internal.Unicode.Stream as U
+import qualified Streamly.Internal.FileSystem.Dir as Dir
 import qualified Streamly.Internal.FileSystem.Handle as FH
-import qualified Streamly.Internal.Data.Array.Storable.Foreign as A
+import qualified Streamly.Internal.Unicode.Stream as U
 
 -------------------------------------------------------------------------------
 -- Subscription to events
@@ -201,7 +199,9 @@ import qualified Streamly.Internal.Data.Array.Storable.Foreign as A
 -- /Internal/
 --
 data Config = Config
-    { createFlags   :: Word32 }
+    { watchRec :: Bool
+    , createFlags :: Word32 
+    }
 
 -------------------------------------------------------------------------------
 -- Boolean settings
@@ -225,166 +225,66 @@ setFlag mask status cfg@Config{..} =
                 Off -> createFlags .&. complement mask
     in cfg {createFlags = flags}
 
--- | Mapping of recursive subdirectories with root dir.
--- key : subdir path 
--- value : tuple of root path and relative subdir path  
--- /Internal/
---
-type RootMap = IORef (M.Map FilePath (FilePath, FilePath))
-
--- | Exclude dir . and .. 
--- while generating list of subdir recursively 
--- /Internal/
---
-exclude :: FilePath -> Bool
-exclude path = head path /= '.'
-
--- | Traverse a dir recusively and return the list of subdirs.
---
--- /Internal/
---
-traverseDirRec :: 
-       FilePath -- ^ subdir path
-    -> FilePath -- ^ root dir path
-    -> [FilePath] -- ^ roots passed on commnd line
-    -> StateT ([FilePath], RootMap) IO [FilePath] -- ^ Mapping with root dir
-traverseDirRec top gtop roots = do
-    dde <- liftIO $ doesDirectoryExist top 
-    if dde 
-    then do
-        ds <- liftIO $ getDirectoryContents top
-        let dss = filter exclude ds  
-        paths <- forM dss $ \d -> do
-            let path = top </> d                   
-            (otop, sdiff) <- liftIO $ getRootSplit $ findRoot path roots             
-            s <- liftIO $ getFileStatus path
-            (st, rootMap) <- get 
-            if isDirectory s        
-            then  do 
-                km <- liftIO $ readIORef rootMap             
-                let k = M.insert path (otop, sdiff) km
-                liftIO $ writeIORef rootMap k
-                put (path : st, rootMap) 
-                traverseDirRec path gtop roots
-            else return []       
-        return (concat paths)
-    else return [] 
-
--- | Map the list of file paths to their root.
--- It's used in non recursive mode so root and subdir path are same
---
--- /Internal/
---
-rootPathMappings :: [FilePath] -> IO (RootMap)
-rootPathMappings paths = do 
-    let pathMap = M.empty      
-        pm2 = foldl (\pmap path -> M.insert path (path,"") pmap ) pathMap 
-            $ paths   
-    newIORef pm2
-
 -------------------------------------------------------------------------------
 -- Utilities
 -------------------------------------------------------------------------------
-
-mergeMap :: RootMap -> RootMap -> IO (RootMap)      
-mergeMap m1 m2 = do
-    xm1 <- readIORef m1
-    xm2 <- readIORef m2
-    newIORef $ M.union xm1 xm2
-
-splitPath :: (MonadIO m) =>
-     FilePath -> FilePath -> m [FilePath]
-splitPath pat xs = S.toList 
+splitPath :: (MonadIO m) => FilePath -> FilePath -> m [FilePath]
+splitPath pat xs = S.toList
     $ S.splitOnSeq (A.fromList pat) (FL.toList) (S.fromList xs)
 
--- | Map the list of original roots passed thru command line to subdir
--- and split the sbudir to original root and remaining path 
--- /Internal/
---
-findRoot :: 
-       FilePath -- ^ subdir path    
-    -> [FilePath] -- ^ list of roots passed thru command line
-    -> S.SerialT IO (FilePath, FilePath) -- ^ Mapping with original root dir
-findRoot xpath rootList = do    
-    let roots = S.fromList rootList :: S.SerialT IO FilePath      
-        splits = S.mapM (\p -> splitPath p xpath) roots
-    ll <- S.filter (\a -> L.length  a > 1) splits
-    index <- S.findIndices (\a -> L.length  a > 1) splits  
-    let k = L.concat ll
-        j = case length k of
+pathDiff :: (MonadIO m) => FilePath -> FilePath -> m FilePath
+pathDiff pat xs =  do
+    splits <- splitPath pat xs
+    let j = case length splits of
                 0 -> ""
-                _ -> tail k
-    return $ (rootList !! index, j)
- 
-getRootSplit :: 
-       S.SerialT IO (FilePath, FilePath) 
-    -> IO (FilePath, FilePath)
+                _ -> last splits
+        t = case length j of
+                0 -> ""
+                _ -> tail j
+    return t
 
-getRootSplit strm = do
-    tlist <- S.toList strm  
-    return $ L.head tlist    
+dirListing :: String -> SerialT IO (Either String String)
+dirListing s = do
+    S.filter dirFilter
+        $ S.iterateMapLeftsWith S.ahead listDir (S.yield $ (Left s))
 
--- | Map the list of input paths to subdir to root path maping.
---
--- /Internal/
---
-generateSubdirMap :: [FilePath] -> [FilePath] -> IO (RootMap)
-generateSubdirMap paths roots = do 
-    let pathMap = M.empty    
-    fpaths <- mapM  (\p -> do
-        let initState = M.insert p (p,"") pathMap
-        mapRef <- newIORef initState  
-        execStateT (traverseDirRec p p roots) ([p], mapRef)) paths  
-    me <- newIORef M.empty
-    foldlM  (\pp qq -> mergeMap pp (snd qq)) me $ fpaths 
+    where
+
+    dirFilter x =
+        case x of
+            Left _ -> True
+            Right _ -> False
+
+    listDir dir =
+        Dir.toEither dir            -- SerialT IO (Either String String)
+        & S.map (bimap prefix prefix) -- SerialT IO (Either String String)
+        
+        where
+        
+        prefix x = dir ++ "/" ++ x
+
+toPathList :: String -> IO [String]
+toPathList root = do
+  S.toList $ S.map toStr $ dirListing root
+
+    where
+
+    toStr x =
+        case x of
+            Left d -> d
+            Right d -> d
 
 toUtf8 :: MonadIO m => String -> m (Array Word8)
 toUtf8 = A.fromStream . U.encodeUtf8 . S.fromList
 
-openWatchRec :: 
-       Config 
-    -> NonEmpty (Array Word8) 
-    -> IO (Config, Watch, RootMap ,[FilePath])
-openWatchRec cfg paths = do
-    let pathList = map  utf8ToString $ NonEmpty.toList paths
-    pathMap <- generateSubdirMap pathList pathList
-    km <- readIORef  pathMap
-    pathArr <- mapM toUtf8 $ M.keys km
-    w <- createWatch
-    foldlM (\(cfg1, w1 ,m1, roots) pth -> addToWatchRec cfg1  w1 m1 pth roots) 
-        (cfg, w, pathMap, pathList) pathArr    
-
-addToWatchRec :: Config -> Watch -> RootMap -> Array Word8 -> [FilePath]
-    -> IO (Config, Watch, RootMap, [FilePath])
-addToWatchRec cfg@Config{..} (Watch handle wdMap) rootMap path roots = do
-    fd <- handleToFd handle
-    wd <- A.asCString path $ \pathPtr ->
-            throwErrnoIfMinus1 ("addToWatchRec " ++ utf8ToString path) $
-                c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
-    km <- readIORef  wdMap
-    let k = (Map.insert (fromIntegral wd) path km)
-    writeIORef wdMap k            
-    return $ (cfg, Watch handle wdMap, rootMap, roots)   
-
-bulkAddToWatch :: Config -> Watch -> RootMap -> Array Word8 -> [FilePath]
-    -> IO (Config, Watch, RootMap)
-bulkAddToWatch cfg@Config{..} (Watch handle wdMap) rootMap newDir roots = do
-    fd <- handleToFd handle
-    pathMap <- generateSubdirMap ((utf8ToString newDir):[]) roots
-    km <- readIORef  pathMap
-    mergedMapRef <- mergeMap rootMap pathMap
-    mergedMap <- readIORef mergedMapRef
-    writeIORef rootMap $ mergedMap     
-    pathArr <- mapM toUtf8 $ M.keys km
-    foldlM (\(_, _ ,_) path -> do 
-            wd <- A.asCString path $ \pathPtr ->
-                throwErrnoIfMinus1 ("addToWatchRec " ++ utf8ToString path) 
-                $ c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
-            km2 <- readIORef  wdMap
-            let k = (Map.insert (fromIntegral wd) path km2)
-            writeIORef wdMap k     
-            return $ (cfg, Watch handle wdMap , rootMap)
-            ) (cfg, Watch handle wdMap , rootMap) pathArr
+-- | Set watch event on directory recursively.
+--
+-- /default: Off/
+--
+-- /Internal/
+--
+setRecursiveMode :: Bool -> Config -> Config
+setRecursiveMode rec cfg@Config{} = cfg {watchRec = rec}
 
 -------------------------------------------------------------------------------
 -- Settings
@@ -670,14 +570,14 @@ defaultConfig :: Config
 defaultConfig =
       setWhenExists AddIfExists
     $ setAllEvents On
-    $ Config { createFlags = 0 }
+    $ Config {watchRec = False, createFlags = 0}
 
 -------------------------------------------------------------------------------
 -- Open an event stream
 -------------------------------------------------------------------------------
 
 -- | A handle for a watch.
-data Watch = Watch Handle (IORef (IntMap (Array Word8)))
+data Watch = Watch Handle (IORef (IntMap (Array Word8, Array Word8)))
 
 -- Instead of using the watch descriptor we can provide APIs that use the path
 -- itself to identify the watch. That will require us to maintain a map from wd
@@ -722,7 +622,7 @@ foreign import ccall unsafe
         :: CInt -> CString -> CUInt -> IO CInt
 
 utf8ToString :: Array Word8 -> String
-utf8ToString = runIdentity . S.toList . U.decodeUtf8 . A.toStream
+utf8ToString = runIdentity . S.toList . U.decodeUtf8' . A.toStream
 
 #if !MIN_VERSION_base(4,10,0)
 -- | Turn an existing Handle into a file descriptor. This function throws an
@@ -750,16 +650,40 @@ handleToFd h = case h of
 --
 -- /Internal/
 --
-addToWatch :: Config -> Watch -> Array Word8 -> IO Watch
-addToWatch Config{..} (Watch handle wdMap) path = do
+addToWatchExecutor ::
+       Config
+    -> Watch
+    -> Array Word8
+    -> Array Word8
+    -> IO (Config, Watch)
+addToWatchExecutor cfg@Config{..} (Watch handle wdMap) pathArr root =  do
+    fd <- handleToFd handle
+    wd <- A.asCString pathArr $ \pathPtr ->
+            throwErrnoIfMinus1 ("addToWatch " ++ utf8ToString pathArr) $
+                c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
+    km <- readIORef wdMap
+    let k = (Map.insert (fromIntegral wd) (root, pathArr) km)
+    writeIORef wdMap k
+    return $ (cfg, Watch handle wdMap) 
+
+addToWatch :: Config -> Watch -> Array Word8 -> IO (Config, Watch)
+addToWatch cfg@Config{..} (Watch handle wdMap) path = do
     fd <- handleToFd handle
     wd <- A.asCString path $ \pathPtr ->
             throwErrnoIfMinus1 ("addToWatch " ++ utf8ToString path) $
                 c_inotify_add_watch (fdFD fd) pathPtr (CUInt createFlags)
-    km <- readIORef  wdMap
-    let k = Map.insert (fromIntegral wd) path km
+    km <- readIORef wdMap
+    let k = (Map.insert (fromIntegral wd) (path, path) km)
     writeIORef wdMap k
-    return $ Watch handle wdMap
+    return $ (cfg, Watch handle wdMap)
+
+addToWatchRec :: Config -> Watch -> FilePath -> FilePath -> IO (Config, Watch)
+addToWatchRec cfg watch path origRoot= do 
+    subdirs <- toPathList path
+    pathArrList <- mapM toUtf8 subdirs
+    rootArr <- toUtf8 origRoot
+    foldlM (\(cfg1, w1) pathArr -> addToWatchExecutor cfg1 w1 pathArr rootArr)
+        (cfg, watch) pathArrList
 
 foreign import ccall unsafe
     "sys/inotify.h inotify_rm_watch" c_inotify_rm_watch
@@ -773,15 +697,15 @@ foreign import ccall unsafe
 removeFromWatch :: Watch -> Array Word8 -> IO Watch
 removeFromWatch (Watch handle wdMap) path = do
     fd <- handleToFd handle
-    xm <- readIORef wdMap
-    wdMap1 <- foldlM (step fd) Map.empty (Map.toList xm)
-    y <-  newIORef wdMap1
-    return $ Watch handle y
+    km <- readIORef wdMap
+    wdMap1 <- foldlM (step fd) Map.empty (Map.toList km)
+    writeIORef wdMap wdMap1
+    return $ Watch handle wdMap
 
     where
 
     step fd newMap (wd, v) = do
-        if v == path
+        if (fst v) == path
         then do
             let err = "removeFromWatch " ++ show (utf8ToString path)
                 rm = c_inotify_rm_watch (fdFD fd) (fromIntegral wd)
@@ -795,23 +719,32 @@ removeFromWatch (Watch handle wdMap) path = do
 --
 -- /Internal/
 --
-openWatch :: 
-       Config 
-    -> NonEmpty (Array Word8) 
-    -> IO (Config, Watch, RootMap, [FilePath])
+openWatch ::
+       Config
+    -> NonEmpty (Array Word8)
+    -> IO (Config, Watch)
 openWatch cfg paths = do
-    let pathList = map  utf8ToString $ NonEmpty.toList paths
+    let pathList = NonEmpty.toList paths
     w <- createWatch
-    pathMap <- rootPathMappings pathList
-    foldlM (\(cfg1, w1 ,m1, roots) pth -> addToWatchRec cfg1  w1 m1 pth roots) 
-        (cfg, w, pathMap, pathList)  (NonEmpty.toList paths)    
-    
+    foldlM (\(cfg1, w1) path -> addToWatch cfg1 w1 path)
+        (cfg, w) pathList
+
+openWatchRec ::
+       Config
+    -> NonEmpty (Array Word8)
+    -> IO (Config, Watch)
+openWatchRec cfg paths = do
+    let pathList = map utf8ToString $ NonEmpty.toList paths
+    w <- createWatch
+    foldlM (\(cfg1, w1) path -> addToWatchRec cfg1 w1 path path)
+        (cfg, w) pathList
+
 -- | Close a 'Watch' handle.
 --
 -- /Internal/
 --
-closeWatch :: (Config, Watch, RootMap, [FilePath]) -> IO ()
-closeWatch (_, (Watch h _), _, _) = hClose h
+closeWatch :: (Config, Watch) -> IO ()
+closeWatch (_, Watch h _) = hClose h
 
 -------------------------------------------------------------------------------
 -- Raw events read from the watch file handle
@@ -829,9 +762,9 @@ data Event = Event
    , eventFlags :: Word32
    , eventCookie :: Word32
    , eventRelPath :: Array Word8
-   , eventMap :: IntMap (Array Word8)
-   , rootPathMap :: M.Map FilePath (FilePath, FilePath)
-   } 
+   , eventMap :: IntMap (Array Word8, Array Word8)
+   } deriving (Show, Ord, Eq)
+
 -- The inotify event struct from the man page/header file:
 --
 --            struct inotify_event {
@@ -846,16 +779,14 @@ data Event = Event
 -- XXX We can perhaps use parseD monad instance for fusing with parseMany? Need
 -- to measure the perf.
 --
-
-readOneEvent :: Config -> Watch -> RootMap -> [FilePath] -> Parser IO Word8 Event
-readOneEvent cfg wt@(Watch _ wdMap) rootMap roots= do
+readOneEvent :: Config -> Watch -> Parser IO Word8 Event
+readOneEvent cfg  wt@(Watch _ wdMap) = do
     let headerLen = (sizeOf (undefined :: CInt)) + 12
     arr <- PR.takeEQ headerLen (A.writeN headerLen)
     (ewd, eflags, cookie, pathLen) <- PR.yieldM $ A.asPtr arr readHeader
     -- XXX need the "initial" in parsers to return a step type so that "take 0"
     -- can return without an input. otherwise if pathLen is 0 we will keep
     -- waiting to read one more char before we return this event.
-   
     path <-
         if pathLen /= 0
         then do
@@ -867,56 +798,51 @@ readOneEvent cfg wt@(Watch _ wdMap) rootMap roots= do
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
             return pth
         else return $ A.fromList []
-    xm <- PR.yieldM $ readIORef wdMap        
+    xm <- PR.yieldM $ readIORef wdMap       
     let base = case Map.lookup (fromIntegral ewd) xm of
                     Just path1 -> path1   
-                    Nothing -> path
-    let xpath = utf8ToString base </> utf8ToString  path   
-    xpathArr <- PR.yieldM $ toUtf8 xpath
-    (_, _, rm) <- processEvent eflags cfg wt rootMap xpathArr xpath roots  
-    rm2 <- PR.yieldM $ readIORef rm
-    xm2 <- PR.yieldM $ readIORef wdMap      
+                    Nothing -> (path, path)
+    let xpath = utf8ToString (snd base) </> utf8ToString  path     
+    _ <- if eflags .&. iN_CREATE /= 0 && eflags .&. iN_ISDIR /= 0
+         then   
+             processEvent cfg wt xpath (utf8ToString $ fst base)  
+         else return (cfg, wt)     
+    rm2 <- PR.yieldM $ readIORef wdMap   
+    pdiff <- PR.yieldM $ pathDiff (utf8ToString $ fst base) xpath
+    relPath <- PR.yieldM $ toUtf8 (pdiff)
     return $ Event
         { eventWd = (fromIntegral ewd)
         , eventFlags = eflags
         , eventCookie = cookie
-        , eventRelPath = path
-        , eventMap = xm2
-        , rootPathMap = rm2
+        , eventRelPath = relPath
+        , eventMap = rm2
         }
 
     where
 
-        readHeader (ptr :: Ptr Word8) = do
-            let len = sizeOf (undefined :: CInt)
-            ewd <- peek ptr
-            eflags <- peekByteOff ptr len
-            cookie <- peekByteOff ptr (len + 4)
-            pathLen :: Word32 <- peekByteOff ptr (len + 8)
-            return (ewd, eflags, cookie, fromIntegral pathLen)
+    readHeader (ptr :: Ptr Word8) = do
+        let len = sizeOf (undefined :: CInt)
+        ewd <- peek ptr
+        eflags <- peekByteOff ptr len
+        cookie <- peekByteOff ptr (len + 4)
+        pathLen :: Word32 <- peekByteOff ptr (len + 8)
+        return (ewd, eflags, cookie, fromIntegral pathLen)
 
-        processEvent :: 
-               Word32 
-            -> Config 
-            -> Watch 
-            -> RootMap 
-            -> Array Word8 
-            -> FilePath            
-            -> [FilePath]
-            -> Parser IO Word8 (Config, Watch, RootMap)
-        processEvent eventFlag cfg1 wt1 rootMap1 path xpath rootList = do
-            if eventFlag .&. iN_CREATE /= 0 && eventFlag .&. iN_ISDIR /= 0
-            then do 
-                km <- PR.yieldM $ readIORef  rootMap1                
-                (gtop, sdiff) <- PR.yieldM 
-                    $ getRootSplit $ findRoot xpath rootList                  
-                let k = M.insert xpath (gtop, sdiff) km
-                PR.yieldM $ writeIORef rootMap1 k                                                        
-                PR.yieldM $ bulkAddToWatch cfg1 wt1 rootMap1 path rootList                                                       
-            else return (cfg1, wt1, rootMap1)
-
-watchToStream :: (Config, Watch, RootMap, [FilePath]) -> SerialT IO Event
-watchToStream (cfg, wt@(Watch handle _), rootMap, roots) =
+    processEvent ::
+           Config
+        -> Watch
+        -> FilePath
+        -> FilePath  
+        -> Parser IO Word8 (Config, Watch)
+    processEvent cfg1@Config{..} wt1 xpath root = do
+            if watchRec
+            then
+                PR.yieldM $ addToWatchRec cfg1 wt1 xpath root
+            else
+                PR.yieldM $ return (cfg1, wt1)       
+        
+watchToStream :: (Config, Watch) -> SerialT IO Event
+watchToStream (cfg, wt@(Watch handle _)) = do
     -- Do not use too small a buffer. As per inotify man page:
     --
     -- The behavior when the buffer given to read(2) is too small to return
@@ -927,7 +853,7 @@ watchToStream (cfg, wt@(Watch handle _), rootMap, roots) =
     --          sizeof(struct inotify_event) + NAME_MAX + 1
     --
     -- will be sufficient to read at least one event.
-    S.parseMany (readOneEvent cfg wt rootMap roots) $ S.unfold FH.read handle
+    S.parseMany (readOneEvent cfg wt) $ S.unfold FH.read handle
 
 -- | Start monitoring a list of file system paths for file system events with
 -- the supplied configuration operation over the 'defaultConfig'. The
@@ -965,18 +891,32 @@ watchPathsWith f paths = S.bracket before after watchToStream
 watchPaths :: NonEmpty (Array Word8) -> SerialT IO Event
 watchPaths = watchPathsWith id
 
-
+-- | Start monitoring a list of file system paths for file system events with
+-- the supplied configuration operation over the 'defaultConfig'. The
+-- paths could be files or directories.  When the path is a directory, the
+-- whole directory tree under it is watched recursively. Monitoring starts from
+-- the current time onwards.
+--
+-- /Internal/
+--
 watchTreesWith ::
     (Config -> Config) -> NonEmpty (Array Word8) -> SerialT IO Event
 watchTreesWith f paths = S.bracket before after watchToStream
 
     where
 
-    before = liftIO $ openWatchRec (f defaultConfig) paths
+    before = liftIO 
+        $ openWatchRec (f $ setRecursiveMode True defaultConfig) paths
     after = liftIO . closeWatch
 
+-- | Like 'watchTreesWith' but uses the 'defaultConfig' options.
+--
+-- @
+-- watchTrees = watchTreesWith id
+-- @
+--
 watchTrees :: NonEmpty (Array Word8) -> SerialT IO Event
-watchTrees = watchTreesWith id    
+watchTrees = watchTreesWith id
 
 -------------------------------------------------------------------------------
 -- Examine event stream
@@ -995,53 +935,11 @@ getRoot Event{..} =
     if (eventWd >= 1)
     then
         case Map.lookup (fromIntegral eventWd) eventMap of
-            Just path -> path
-            Nothing -> 
-                error $ "Bug: getRoot: No path found corresponding to the "
-                    ++ "watch descriptor " ++ show eventWd
-    else A.fromList []
-
--- | Get the original root path of mapped subdir
---
--- /Internal/
---
-getMappedRoot :: Event -> String
-getMappedRoot Event{..} =    
-    if (eventWd >= 1)
-    then
-        case Map.lookup (fromIntegral eventWd) eventMap of
-            Just path -> case M.lookup (utf8ToString path) rootPathMap of
-                            Just rpath -> fst rpath
-                            Nothing -> error 
-                                $ "Bug: getRoot: No path found "
-                                ++ "corresponding to the "
-                                ++ "watch descriptor " 
-                                ++ show eventWd
+            Just path -> fst path
             Nothing ->
                 error $ "Bug: getRoot: No path found corresponding to the "
                     ++ "watch descriptor " ++ show eventWd
-    else ""
-       
--- | Get the relative path w.r.t root dir of mapped target
---
--- /Internal/
---
-getMappedRelPath :: Event -> String
-getMappedRelPath Event{..} = 
-    let sfx = utf8ToString eventRelPath 
-        pfx = case Map.lookup (fromIntegral eventWd) eventMap of
-                Just path -> case M.lookup (utf8ToString path) rootPathMap of
-                                Just rpath -> snd rpath
-                                Nothing -> error 
-                                    $ "Bug: getRoot: No path found "
-                                    ++ "corresponding to the "
-                                    ++ "watch descriptor " 
-                                    ++ show eventWd
-                Nothing ->
-                    error $ "Bug: getRoot: No path found corresponding to the "
-                    ++ "watch descriptor " ++ show eventWd                    
-        in pfx </> sfx                            
-
+    else A.fromList []
 
 -- XXX should we use a Maybe here?
 -- | Get the file system object path for which the event is generated, relative
@@ -1289,9 +1187,9 @@ isDir = getFlag iN_ISDIR
 showEvent :: Event -> String
 showEvent ev@Event{..} =
        "--------------------------"
-    ++ "\nWd = " ++ show eventWd        
-    ++ "\nRoot = " ++ show (getMappedRoot ev)   
-    ++ "\nPath = " ++ show (getMappedRelPath ev)
+    ++ "\nWd = " ++ show eventWd
+    ++ "\nRoot = " ++ show (utf8ToString $ getRoot ev)
+    ++ "\nPath = " ++ show (utf8ToString $ getRelPath ev)
     ++ "\nCookie = " ++ show (getCookie ev)
     ++ "\nFlags " ++ show eventFlags
 

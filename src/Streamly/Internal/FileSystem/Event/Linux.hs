@@ -787,6 +787,8 @@ readOneEvent cfg  wt@(Watch _ wdMap) = do
     -- XXX need the "initial" in parsers to return a step type so that "take 0"
     -- can return without an input. otherwise if pathLen is 0 we will keep
     -- waiting to read one more char before we return this event.
+    PR.yieldM $ print ("Flag1 = " ++ show eflags)
+    PR.yieldM $ print ("pathLen = " ++ show pathLen)
     path <-
         if pathLen /= 0
         then do
@@ -795,19 +797,22 @@ readOneEvent cfg  wt@(Watch _ wdMap) = do
             -- takeP
             pth <- PR.sliceSepByMax (== 0) pathLen (A.writeN pathLen)
             let remaining = pathLen - A.length pth - 1
+            PR.yieldM $ print ("remaining = " ++ show remaining)
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
+            PR.yieldM $ print ("takeEQ = " ++ show remaining)
             return pth
         else return $ A.fromList []
-    xm <- PR.yieldM $ readIORef wdMap       
+    PR.yieldM $ print ("Flag2 = " ++ show eflags)    
+    xm <- PR.yieldM $ readIORef wdMap           
     let base = case Map.lookup (fromIntegral ewd) xm of
                     Just path1 -> path1   
                     Nothing -> (path, path)
-    let xpath = utf8ToString (snd base) </> utf8ToString  path     
+    let xpath = utf8ToString (snd base) </> utf8ToString  path
     _ <- if eflags .&. iN_CREATE /= 0 && eflags .&. iN_ISDIR /= 0
          then   
              processEvent cfg wt xpath (utf8ToString $ fst base)  
-         else return (cfg, wt)     
-    rm2 <- PR.yieldM $ readIORef wdMap   
+         else return (cfg, wt)
+    rm2 <- PR.yieldM $ readIORef wdMap
     pdiff <- PR.yieldM $ pathDiff (utf8ToString $ fst base) xpath
     relPath <- PR.yieldM $ toUtf8 (pdiff)
     return $ Event

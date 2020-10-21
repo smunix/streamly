@@ -33,6 +33,7 @@ state data type to represent the internal state of the stream/unfold generator.
   ensure that all the internal join points created by GHC are inlined with the
   help of the `fusion-plugin`.
 * In rare cases we may need to use a strictness annotation on the state.
+  `parseMany` is one such example.
 
 Step function of a stream or unfold:
 

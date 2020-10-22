@@ -96,6 +96,9 @@ safeLast (_:xs) = safeLast xs
 last :: [String] -> Expectation
 last ls = S.fold FL.last (S.fromList ls) `shouldReturn` safeLast ls
 
+mapMaybe :: Expectation
+mapMaybe = S.fold (F.mapMaybe (\x -> case x of  5 -> Just x ; _ -> Nothing) F.sum)
+    (S.enumerateFromTo 1 10) `shouldReturn` (5 :: Int)
 
 nth :: Int -> [a] -> Maybe a
 nth idx (x:xs) = if idx == 0
@@ -213,3 +216,4 @@ main = hspec $
         prop "Any" $ Main.any predicate
         prop "And" Main.and
         prop "Or" Main.or
+        prop "mapMaybe" mapMaybe

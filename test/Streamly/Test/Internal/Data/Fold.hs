@@ -96,9 +96,9 @@ safeLast (_:xs) = safeLast xs
 last :: [String] -> Expectation
 last ls = S.fold FL.last (S.fromList ls) `shouldReturn` safeLast ls
 
-mapMaybe :: Expectation
-mapMaybe = S.fold (F.mapMaybe (\x -> case x of  5 -> Just x ; _ -> Nothing) F.sum)
-    (S.enumerateFromTo 1 10) `shouldReturn` (5 :: Int)
+mapMaybe :: [Int] -> Expectation
+mapMaybe ls = S.fold (F.mapMaybe (\x -> if even x then Just x else Nothing) FL.toList)
+   (S.fromList ls) `shouldReturn` filter even ls 
 
 nth :: Int -> [a] -> Maybe a
 nth idx (x:xs) = if idx == 0

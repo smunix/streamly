@@ -136,7 +136,6 @@ module Streamly.Internal.Data.Fold.Types
 
     , duplicate
     , initialize
-    , mapMaybe
     , runStep
     )
 where
@@ -353,16 +352,6 @@ lmapM :: Monad m => (a -> m b) -> Fold m b r -> Fold m a r
 lmapM f (Fold step begin done) = Fold step' begin done
   where
     step' x a = f a >>= step x
-
--- | @(mapMaybe f fold)@ maps a 'Maybe' returning function @f@ on the input of the fold,
--- filter out the 'Nothing' elements, and return a values extracted from 'Just'.
--- >>> S.fold (FL.mapMaybe (\x -> case x of  5 -> Just x ; _ -> Nothing) FL.sum) 
--- (S.enumerateFromTo 1 10) 
--- 5
--- /Internal/
-{-# INLINE mapMaybe #-}
-mapMaybe :: (Monad m) => (a -> Maybe b) -> Fold m b r -> Fold m a r
-mapMaybe f = lmap f . lfilter isJust . lmap fromJust
 
 ------------------------------------------------------------------------------
 -- Filtering

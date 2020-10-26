@@ -4564,8 +4564,8 @@ foldOnce (Fold fstep begin done) (Stream step state) =
                 case res of
                     FL.Done b -> return b
                     FL.Done1 b -> return b
-                    FL.Partial sres -> go SPEC sres s
-                    FL.Partial1 sres -> goBuf SPEC sres st x
+                    FL.Partial fs1 -> go SPEC fs1 s
+                    FL.Partial1 fs1 -> goBuf SPEC fs1 s x
             Skip s -> go SPEC fs s
             Stop   -> done fs
 
@@ -4574,8 +4574,8 @@ foldOnce (Fold fstep begin done) (Stream step state) =
         case res of
             FL.Done b -> return b
             FL.Done1 b -> return b
-            FL.Partial sres -> go SPEC sres st
-            FL.Partial1 sres -> goBuf SPEC sres st x
+            FL.Partial fs1 -> go SPEC fs1 st
+            FL.Partial1 fs1 -> goBuf SPEC fs1 st x
 
 -------------------------------------------------------------------------------
 -- Concurrent application and fold

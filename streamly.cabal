@@ -738,8 +738,8 @@ test-suite fsevent-notify-test
     , base              >= 4.9   && < 5
     , hspec             >= 2.0   && < 3
     , QuickCheck        >= 2.14  && < 2.15
-    , directory         >= 1.3.3
-    , containers        >= 0.6.0
+    , directory         >= 1.2.2 && < 1.4
+    , containers        >= 0.5   && < 0.7
     , filepath          >= 1.4.1
   default-language: Haskell2010  
 

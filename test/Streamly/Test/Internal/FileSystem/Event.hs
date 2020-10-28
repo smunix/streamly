@@ -217,7 +217,7 @@ testRunner = do
     _ <- forkIO $ driver handle rootPath (Sync pre) 
     startTestRunner $ Sync pre   
     stopTask
-    threadDelay (2000000)
+    threadDelay (60000000)
     hClose handle
     validate
 

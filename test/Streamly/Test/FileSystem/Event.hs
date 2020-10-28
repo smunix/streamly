@@ -43,14 +43,7 @@ toUtf8 = Array.fromStream . Unicode.encodeUtf8' . Stream.fromList
 -------------------------------------------------------------------------------
 
 watchPaths :: NonEmpty (Array Word8) -> SerialT IO Event.Event
-
-#if defined(CABAL_OS_DARWIN)
 watchPaths = Event.watchTrees
-#elif defined(CABAL_OS_LINUX)
-watchPaths = Event.watchPaths
-#else
-#error "Unsupported platform
-#endif
 
 main :: IO ()
 main = do

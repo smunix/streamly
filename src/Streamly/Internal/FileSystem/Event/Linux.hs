@@ -142,6 +142,7 @@ module Streamly.Internal.FileSystem.Event.Linux
 
     -- * Debugging
     , showEvent
+    , showEventShort
     )
 where
 
@@ -787,8 +788,8 @@ readOneEvent cfg  wt@(Watch _ wdMap) = do
     -- XXX need the "initial" in parsers to return a step type so that "take 0"
     -- can return without an input. otherwise if pathLen is 0 we will keep
     -- waiting to read one more char before we return this event.
-    PR.yieldM $ print ("Flag1 = " ++ show eflags)
-    PR.yieldM $ print ("pathLen = " ++ show pathLen)
+    -- PR.yieldM $ print ("Flag1 = " ++ show eflags)
+    -- PR.yieldM $ print ("pathLen = " ++ show pathLen)
     path <-
         if pathLen /= 0
         then do
@@ -797,12 +798,12 @@ readOneEvent cfg  wt@(Watch _ wdMap) = do
             -- takeP
             pth <- PR.sliceSepByMax (== 0) pathLen (A.writeN pathLen)
             let remaining = pathLen - A.length pth - 1
-            PR.yieldM $ print ("remaining = " ++ show remaining)
+            -- PR.yieldM $ print ("remaining = " ++ show remaining)
             when (remaining /= 0) $ PR.takeEQ remaining FL.drain
-            PR.yieldM $ print ("takeEQ = " ++ show remaining)
+            -- PR.yieldM $ print ("takeEQ = " ++ show remaining)
             return pth
         else return $ A.fromList []
-    PR.yieldM $ print ("Flag2 = " ++ show eflags)    
+    -- PR.yieldM $ print ("Flag2 = " ++ show eflags)    
     xm <- PR.yieldM $ readIORef wdMap           
     let base = case Map.lookup (fromIntegral ewd) xm of
                     Just path1 -> path1   
@@ -1187,6 +1188,12 @@ isDir = getFlag iN_ISDIR
 -------------------------------------------------------------------------------
 -- Debugging
 -------------------------------------------------------------------------------
+showEventShort :: Event -> String
+showEventShort ev@Event{..} = (utf8ToString $ getRelPath ev) 
+    ++ "_" ++ show eventFlags
+    ++ showev isDir "Dir"
+
+    where showev f str = if f ev then "_" ++ str else ""
 
 -- | Convert an 'Event' record to a String representation.
 showEvent :: Event -> String

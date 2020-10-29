@@ -58,7 +58,7 @@ baseList =
     , "Oct23_1073741840_Dir"
     , "Oct23/Oct24_1073741856_Dir"
     , "Oct23/Oct24_1073741825_Dir"
-    , "Oct23/Oct24_1073741840_Dir"
+    , "Oct23/Oct24_1073741840_DirX"
     , "Oct23/Oct24/Oct25_1073741856_Dir"
     , "Oct23/Oct24/Oct25_1073741825_Dir"
     , "Oct23/Oct24/Oct25_1073741840_Dir"
@@ -209,6 +209,7 @@ validate :: IO [Char]
 validate = do
     let baseSet = Set.fromList baseList
     resultSet <- processResult
+    mapM_ (\x -> if (Set.member x resultSet) then  print x else print (x ++ "....Missed" ) ) baseList    
     if (baseSet `Set.isSubsetOf` resultSet)
     then
         return "PASSED"

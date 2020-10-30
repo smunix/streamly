@@ -51,7 +51,7 @@ watchPaths :: NonEmpty (Array Word8) -> SerialT IO Event.Event
 watchPaths = Event.watchTrees
 
 baseList :: [String]
-baseList =
+baseList =  -- ^ List of predefined RelPath_EventFlag_Dir to be matched
     [ "Oct23_1073742080_Dir"
     , "Oct23_1073741856_Dir"
     , "Oct23_1073741825_Dir"
@@ -95,11 +95,11 @@ eventPredicate ev =
 
 initTest :: Sync -> IO Sync
 initTest (Sync m)= do
-    _ <- takeMVar m
-    threadDelay (1000000)
+    _ <- takeMVar m    
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
-    createDirectoryIfMissing True (watchDir </> "Oct23")
+    threadDelay (1000000)  -- ^ wait for Event driver to process the Events
+        >> createDirectoryIfMissing True (watchDir </> "Oct23")
     print "initTest >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
@@ -110,7 +110,8 @@ testListing (Sync m) = do
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         tpath = (watchDir </> "Oct23")
-    _ <- listDirectory tpath
+    _ <- threadDelay (1000000)  -- ^ wait for Event driver to process the Events
+        >> listDirectory tpath
     print "testListing >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
@@ -121,20 +122,20 @@ testCreateDir (Sync m) = do
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         tpath = (watchDir </> "Oct23" </> "Oct24" </> "Oct25" </> "dirnew")
-    createDirectoryIfMissing True tpath
+    threadDelay (1000000)  -- ^ wait for Event driver to process the Events    
+        >> createDirectoryIfMissing True tpath
     print "testCreateDir >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
 
 testRenameDir :: Sync -> IO Sync
 testRenameDir (Sync m) = do
-    _ <- takeMVar m
-    threadDelay(2000000)
+    _ <- takeMVar m    
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         src = (watchDir </> "Oct23" </> "Oct24" </> "Oct25" </> "dirnew")
         tgt = (watchDir </> "Oct23" </> "Oct24" </> "Oct25" </> "renamed")
-    renamePath src tgt
+    threadDelay(1000000) >> renamePath src tgt
     print "testRenameDir >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
@@ -145,8 +146,10 @@ testRemoveDir (Sync m) = do
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         tpath = (watchDir </> "Oct23" </> "Oct24" </> "Oct25" </> "renamed")
-    removePathForcibly tpath
-    createDirectoryIfMissing True (watchDir </> "stop_event_tracker")
+    threadDelay (1000000)  -- ^ wait for Event driver to process the Events    
+        >> removePathForcibly tpath
+    threadDelay (100000)  -- ^ wait for Event driver to process the Events    
+        >> createDirectoryIfMissing True (watchDir </> "stop_event_tracker")
     print "testRemoveDir >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
@@ -171,7 +174,8 @@ testRenameFile (Sync m) = do
     let watchDir = (cwd </> "watch")
         spath = (watchDir </> "Oct23/Oct24/Oct25" </> "Filecreate.txt")
         tpath = (watchDir </> "Oct23/Oct24/Oct25" </> "FileRenamed.txt")
-    renameFile spath tpath
+    threadDelay (1000000)  -- ^ wait for Event driver to process the Events    
+        >> renameFile spath tpath
     print "testRenameFile >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)
@@ -182,7 +186,8 @@ testRemoveFile (Sync m) = do
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         tpath = (watchDir </> "Oct23/Oct24/Oct25" </> "FileRenamed.txt")
-    removeFile tpath
+    threadDelay (1000000)  -- ^ wait for Event driver to process the Events    
+        >> removeFile tpath
     print "testRemoveFile >>>>>>>>>>>>>>>>>>"
     putMVar m "driverStart"
     return (Sync m)

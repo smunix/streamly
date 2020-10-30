@@ -25,15 +25,26 @@ import qualified Streamly.Internal.FileSystem.Event.Windows as Event
 
 import System.IO
 import qualified Data.Set as Set
+#if !defined(CABAL_OS_WINDOWS)
 import qualified Streamly.Internal.Unicode.Stream as U
 import Data.Functor.Identity (runIdentity)
+#endif
 
 main :: IO ()
-main = hspec $ after_ destroy $ do
-    prop "validator" validator
+main = hspec $ do
+    prop "Recursive directory events validator" validator
+    prop "Staging directories cleanUp" cleanUp   
 
 validator ::  Expectation
 validator = testRunner `shouldReturn` "PASSED"
+
+#if defined(CABAL_OS_WINDOWS)
+cleanUp :: Expectation
+cleanUp = destroy `shouldThrow` anyException
+#else
+cleanUp :: Expectation
+cleanUp = destroy `shouldReturn` "CLEAN"
+#endif
 
 -------------------------------------------------------------------------------
 -- Utilities
@@ -41,9 +52,10 @@ validator = testRunner `shouldReturn` "PASSED"
 toUtf8 :: MonadIO m => String -> m (Array Word8)
 toUtf8 = Array.fromStream . Unicode.encodeUtf8' . Stream.fromList
 
+#if !defined(CABAL_OS_WINDOWS)
 utf8ToString :: Array Word8 -> String
 utf8ToString = runIdentity . Stream.toList . U.decodeUtf8' . Array.toStream
-
+#endif
 -------------------------------------------------------------------------------
 -- Main
 -------------------------------------------------------------------------------
@@ -52,6 +64,27 @@ watchPaths = Event.watchTrees
 
 baseList :: [String]
 baseList =  -- ^ List of predefined RelPath_EventFlag_Dir to be matched
+#if defined(CABAL_OS_WINDOWS)
+    [ "Oct23_1"
+    , "Oct23\\Oct24_1"
+    , "Oct23\\Oct24\\Oct25_1"
+    , "Oct23\\Oct24\\Oct25\\dirnew_1"
+    , "Oct23\\Oct24\\Oct25_3"
+    , "Oct23\\Oct24\\Oct25\\dirnew_4"
+    , "Oct23\\Oct24\\Oct25\\renamed_5"
+    , "Oct23\\Oct24\\Oct25_3"
+    , "Oct23_3"
+    , "Oct23\\Oct24\\Oct25\\Filecreate.txt_1"
+    , "Oct23\\Oct24\\Oct25\\Filecreate.txt_3"
+    , "Oct23\\Oct24\\Oct25\\Filecreate.txt_3"
+    , "Oct23\\Oct24\\Oct25_3"
+    , "Oct23\\Oct24\\Oct25\\Filecreate.txt_4"
+    , "Oct23\\Oct24\\Oct25\\FileRenamed.txt_5"
+    , "Oct23\\Oct24\\Oct25_3"
+    , "Oct23\\Oct24\\Oct25\\FileRenamed.txt_2"
+    , "Oct23\\Oct24\\Oct25\\renamed_2"
+    ]
+#else
     [ "Oct23_1073742080_Dir"
     , "Oct23_1073741856_Dir"
     , "Oct23_1073741825_Dir"
@@ -73,6 +106,7 @@ baseList =  -- ^ List of predefined RelPath_EventFlag_Dir to be matched
     , "Oct23/Oct24/Oct25/FileRenamed.txt_128"
     , "Oct23/Oct24/Oct25/FileRenamed.txt_512"
     ]
+#endif
 
 data Sync = Sync (MVar String)
 
@@ -89,7 +123,11 @@ driver handle rootPath (Sync m1) (Sync m2) = do
 
 eventPredicate :: Event.Event -> Bool
 eventPredicate ev =
+#if defined(CABAL_OS_WINDOWS)
+    if (Event.getRelPath ev) == "stop_event_tracker"
+#else    
     if (utf8ToString $ Event.getRelPath ev) == "stop_event_tracker"
+#endif    
     then False
     else True
 
@@ -192,14 +230,14 @@ testRemoveFile (Sync m) = do
     putMVar m "driverStart"
     return (Sync m)
 
-destroy :: IO ()
+destroy :: IO [Char]
 destroy = do
     cwd <- getCurrentDirectory
     let watchDir = (cwd </> "watch")
         resultPath = cwd </> "testResult"
     removePathForcibly watchDir
     removePathForcibly resultPath
-    print "destroy >>>>>>>>>>>>>>>>>>"
+    return "CLEAN"
 
 stopTask :: IO ()
 stopTask =  do
@@ -207,11 +245,15 @@ stopTask =  do
     print "stopTask @@@@@@@@@@@@@@"
 
 validate :: IO [Char]
-validate = do
+validate = do  -- ^ print Events matched or missed
     let baseSet = Set.fromList baseList
     resultSet <- processResult
-    mapM_ (\x -> if (Set.member x resultSet) then  print x else print (x ++ "....Missed" )) baseList    
-    if (baseSet `Set.isSubsetOf` resultSet)
+    mapM_ ( \x -> 
+        if Set.member x resultSet
+        then  print (x ++ "....Matched")
+        else print (x ++ "....Missed") ) 
+        baseList    
+    if baseSet `Set.isSubsetOf` resultSet
     then
         return "PASSED"
     else
@@ -244,11 +286,12 @@ testRunner = do
     createDirectoryIfMissing True rootPath
     createDirectoryIfMissing True resultPath
     handle <- openFile fpath WriteMode
-    _ <- forkIO $ driver handle rootPath (Sync pre) (Sync post)
+    tid <- forkIO $ driver handle rootPath (Sync pre) (Sync post)
     startTestRunner $ Sync pre
     _ <- takeMVar post
     stopTask
     hClose handle
+    killThread tid
     validate
 
 processResult :: IO (Set.Set String)

@@ -43,8 +43,9 @@ Run all O(1) space complexity benchmarks in `Prelude.Serial` suite:
 $ ./bench.sh --benchmarks Prelude.Serial -- Prelude.Serial/o-1-space
 ```
 
-Anything after a `--` is passed to gauge, it basically selects all benchmarks
-starting with `Prelude.Serial/o-1-space` prefix.
+Anything after a `--` is passed to the benchmark executable,
+it basically selects all benchmarks starting with
+`Prelude.Serial/o-1-space` prefix.
 
 Run a specific benchmark in `Prelude.Serial` suite:
 
@@ -58,7 +59,7 @@ Run a benchmark directly instead of running it through `bench.sh`:
 $ cabal run bench:Prelude.Serial -- --quick Prelude.Serial/o-1-space/generation/unfoldr
 ```
 
-The options after `--` are the `gauge` options.
+The options after `--` are the benchmark executable options.
 
 ## Comparing results of arbitrary runs
 

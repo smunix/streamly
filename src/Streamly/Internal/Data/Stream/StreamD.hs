@@ -1793,7 +1793,7 @@ data SplitOnSeqState rb rh ck w fs s b x =
     | SplitOnSeqDone
 
     | SplitOnSeqEmpty s
-    | SplitOnSeqSingle !fs s
+    | SplitOnSeqSingle !fs s x
 
     | SplitOnSeqWordInit s
     | SplitOnSeqWordLoop !w s !fs
@@ -1818,9 +1818,6 @@ splitOnSeq patArr (Fold fstep initial done) (Stream step state) =
     patLen = A.length patArr
     maxIndex = patLen - 1
     elemBits = sizeOf (undefined :: a) * 8
-
-    -- For single pattern case
-    !singlePat = A.unsafeIndex patArr 0
 
     -- For word pattern case
     wordMask :: Word
@@ -1855,7 +1852,8 @@ splitOnSeq patArr (Fold fstep initial done) (Stream step state) =
         else if patLen == 1
              then do
                  acc <- initial
-                 return $ Skip $ SplitOnSeqSingle acc state
+                 let !pat = A.unsafeIndex patArr 0
+                 return $ Skip $ SplitOnSeqSingle acc state pat
              else if sizeOf (undefined :: a) * patLen
                        <= sizeOf (undefined :: Word)
                   then return $ Skip $ SplitOnSeqWordInit state
@@ -1890,19 +1888,19 @@ splitOnSeq patArr (Fold fstep initial done) (Stream step state) =
     -- Single Pattern
     -----------------
 
-    stepOuter gst (SplitOnSeqSingle fs st) = do
+    stepOuter gst (SplitOnSeqSingle fs st pat) = do
         res <- step (adaptState gst) st
         case res of
             Yield x s -> do
-                if singlePat == x
+                if pat == x
                 then do
                     r <- done fs
                     fs1 <- initial
-                    return $ Skip $ SplitOnSeqYield r (SplitOnSeqSingle fs1 s)
+                    return $ Skip $ SplitOnSeqYield r (SplitOnSeqSingle fs1 s pat)
                 else do
                     fs1 <- fstep fs x
-                    return $ Skip $ (SplitOnSeqSingle fs1 s)
-            Skip s -> return $ Skip $ SplitOnSeqSingle fs s
+                    return $ Skip $ (SplitOnSeqSingle fs1 s pat)
+            Skip s -> return $ Skip $ SplitOnSeqSingle fs s pat
             Stop -> do
                 r <- done fs
                 return $ Skip $ SplitOnSeqYield r SplitOnSeqDone
